@@ -27,10 +27,10 @@
   - [2. Callback Validation & Execution Lifecycle (`validate()`) — 10 Steps](#2-callback-validation--execution-lifecycle-validate--10-steps)
   - [3. Client Return Security (`success()`)](#3-client-return-security-success)
   - [Cancellation Flow Comparison (Paysera Pattern)](#cancellation-flow-comparison-paysera-pattern)
-- [Database Schema & Audit Preservation](#database-schema--audit-preservation)
+- [Database Schema & Clean-up](#database-schema--clean-up)
   - [Column & Index Reference](#column--index-reference)
   - [State Machine Reference](#state-machine-reference)
-  - [Audit Preservation on Uninstall](#audit-preservation-on-uninstall)
+  - [Clean-up and Uninstall](#clean-up-and-uninstall)
 - [Code Architecture, Constants & Key Methods](#code-architecture-constants--key-methods)
   - [Gateway Constants](#gateway-constants)
   - [Public Blesta Contract Methods](#public-blesta-contract-methods)
@@ -77,7 +77,7 @@ The gateway implements the **Tokenized Checkout (Without Agreement)** flow (`mod
 | **Network Drop Resilience** | Automatic fallback from `/execute` to `/payment/status` to prevent charging customers without recording payments |
 | **Cancellation Handling** | Clean return handling with user-friendly notices when a customer cancels (`?status=cancel` or `?status=failure`) |
 | **Encrypted Storage & Log Scrubbing** | Sensitive fields (`app_secret`, `password`) encrypted at rest by Blesta and scrubbed (`[redacted]`) from gateway logs |
-| **Audit Trail Persistence** | Dedicated `bkash_payment_attempts` table preserved even across module uninstalls for financial compliance |
+| **Payment Attempt Tracking** | Dedicated `bkash_payment_attempts` table; unpaid attempts are deleted once expired, and the table is dropped when the gateway is uninstalled from the last company |
 
 ---
 
@@ -133,7 +133,7 @@ bkash/
 ### Method 2: Composer Installation
 
 ```bash
-composer require custom/blesta-bkash
+composer require blesta/bkash
 ```
 
 ---
@@ -148,10 +148,10 @@ In Blesta Admin, navigate to **Settings → Payment Gateways → Installed → b
 | **App Secret** | Secret key used for HMAC callback signing and `/token/grant` requests | bKash Merchant Portal (encrypted at rest by Blesta) |
 | **API Username** | Username sent in HTTP headers during token acquisition | bKash Merchant Portal |
 | **API Password** | Password sent in HTTP headers during token acquisition | bKash Merchant Portal (encrypted at rest by Blesta) |
-| **Sandbox Mode (Test)** | When checked, connects to the sandbox API. When unchecked, connects to live production | Toggle switch in gateway settings |
+| **Sandbox Mode (Test)** | When checked, connects to the sandbox API. When unchecked, connects to live production | Checkbox in gateway settings |
 
 > [!IMPORTANT]
-> Because `app_secret` and `password` are declared in `encryptableFields()` and encrypted at rest by Blesta upon saving, they are **never redisplayed** in plaintext inside `views/default/settings.pdt`. When updating settings in the admin area, re-enter your secret and password if modifying credentials.
+> Because `app_secret` and `password` are declared in `encryptableFields()`, Blesta encrypts them at rest. The settings form shows them in masked password fields, so other settings can be changed without re-entering them.
 
 ---
 
@@ -282,6 +282,7 @@ When bKash redirects the user or sends a callback to Blesta, `validate()` execut
 - It **never** independently calls `/execute` or captures funds, protecting the system against client-side browser redirect manipulation.
 - It inspects the local attempt row to verify that server-side `validate()` has already transitioned the payment to `verified`.
 - Once confirmed, it transitions the attempt state from $\text{verified} \to \text{completed}$ and renders the final invoice confirmation screen.
+- A cancelled return only shows a notice; it never changes the attempt, because the `status` parameter isn't signed.
 
 ### Cancellation Flow Comparison (Paysera Pattern)
 
@@ -292,7 +293,7 @@ Following the official Blesta `gateway-paysera` and `gateway-sslcommerz` pattern
 
 ---
 
-## Database Schema & Audit Preservation
+## Database Schema & Clean-up
 
 The module creates and maintains `bkash_payment_attempts` via `createAttemptTable()` to track the full state machine of every checkout session:
 
@@ -342,13 +343,15 @@ CREATE TABLE IF NOT EXISTS `bkash_payment_attempts` (
 | `created` | Initial attempt row provisioned in Blesta before calling bKash `/create` | `redirected`, `failed` |
 | `redirected` | bKash `paymentID` received and customer presented with validated `bkashURL` | `executing`, `failed` |
 | `executing` | Callback received; row atomically locked by server process to invoke `/execute` | `verified`, `redirected` (on lock retry), `failed` |
-| `verified` | bKash `/execute` (or `/payment/status`) confirmed `Completed` and passed deep verification | `completed`, `failed` |
+| `verified` | bKash `/execute` (or `/payment/status`) confirmed `Completed` and passed deep verification | `completed`, `executing` (retry if Blesta did not record the payment) |
 | `completed` | Client return confirmed via `success()` after Blesta credited the invoice (Final Success) | *Terminal* |
 | `failed` | Customer cancelled, attempt expired, or signature/amount verification failed | *Terminal* |
 
-### Audit Preservation on Uninstall
+### Clean-up and Uninstall
 
-When `uninstall($gateway_id, $last_instance)` is triggered in Blesta, the module **intentionally retains** the `bkash_payment_attempts` table. Preserving historical payment attempt records, `trxID` references, and failure logs is critical for financial dispute resolution, chargeback auditing, and tax compliance.
+Each time a payment is started, attempts that expired without being paid (`created`, `redirected` or `failed`, with no `trxID`) are deleted, e.g. payment pages that were viewed but never paid. Paid attempts (`verified`, `completed`) and stuck `executing` attempts are kept. A paid attempt is never marked `failed`, since the callback `status` parameter isn't signed.
+
+The table is shared by all companies, so `uninstall($gateway_id, $last_instance)` drops it only when the gateway is uninstalled from the last company. Completed payments remain as Blesta transactions, with the bKash `paymentID` as the transaction ID and the `trxID` as the reference ID.
 
 ---
 
@@ -368,7 +371,7 @@ All core gateway logic resides in `bkash.php`.
 
 - `__construct()`: Loads `config.json`, initializes the `Input` component, and loads localized language strings.
 - `install()` / `upgrade($current_version)`: Executes idempotent `createAttemptTable()` schema initialization.
-- `uninstall($gateway_id, $last_instance)`: Cleans up module state while preserving the `bkash_payment_attempts` audit table.
+- `uninstall($gateway_id, $last_instance)`: Drops the `bkash_payment_attempts` table when the gateway is uninstalled from the last company.
 - `setCurrency($currency)`: Configures the active transaction currency (enforced to `BDT`).
 - `setMeta(array $meta)`: Injects admin-configured gateway credentials and sandbox settings.
 - `encryptableFields()`: Declares `['app_secret', 'password']` for automatic AES-256 encryption at rest by Blesta.
@@ -393,7 +396,7 @@ All core gateway logic resides in `bkash.php`.
 - **`views/default/settings.pdt`**: Uses Blesta view helpers (`$this->Html->safe()`, `$this->Form`) to render the admin settings panel with CSRF protection and masked secret inputs.
 - **`views/default/process.pdt`**: Handles two distinct UI states during checkout:
   1. **Error State**: Renders a clean alert message if initialization (`buildProcess()`) encountered a configuration or network error.
-  2. **Checkout Redirect State**: Renders the branded bKash payment button linking to the validated `bkashURL`.
+  2. **Checkout Redirect State**: Renders the bKash payment button linking to the validated `bkashURL`, using markup shared by every client theme.
 
 ---
 

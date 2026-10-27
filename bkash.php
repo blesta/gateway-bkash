@@ -125,17 +125,18 @@ class Bkash extends NonmerchantGateway
      *
      * Executed when the administrator uninstalls the gateway from Blesta.
      *
-     * CRITICAL AUDIT / COMPLIANCE NOTE:
-     * We deliberately DO NOT drop the `bkash_payment_attempts` table here.
-     * Financial audit trails, bKash transaction IDs (trxID), and customer payment records
-     * must be permanently retained for dispute resolution, accounting reconciliations, and tax compliance.
+     * The `bkash_payment_attempts` table is shared by all companies, so it is dropped with the last instance only.
+     * Completed payments remain as Blesta transactions (paymentID as the transaction ID, trxID as the reference ID).
      *
      * @param int $gateway_id The ID of the gateway being uninstalled
      * @param bool $last_instance True if this is the last instance of this gateway across all companies
      */
     public function uninstall($gateway_id, $last_instance)
     {
-        // Retain payment attempts as transaction audit records.
+        if ($last_instance) {
+            $record = new Record();
+            $record->drop(self::ATTEMPT_TABLE, true);
+        }
     }
 
     /**
@@ -239,7 +240,10 @@ class Bkash extends NonmerchantGateway
                 ]
             ];
         }
-        // Enforce strict boolean string for the sandbox flag.
+        // Enforce strict boolean string for the sandbox flag, which isn't submitted when unchecked.
+        if (empty($meta['sandbox'])) {
+            $meta['sandbox'] = 'false';
+        }
         $rules['sandbox'] = [
             'valid' => [
                 'rule' => ['in_array', ['true', 'false']],
@@ -291,26 +295,23 @@ class Bkash extends NonmerchantGateway
         // to avoid IEEE 754 floating-point rounding discrepancies.
         $amount_paisa = $this->toPaisa($amount);
         $allocations = $this->normalizeInvoiceAmounts($invoice_amounts ?? []);
-        if ($amount_paisa === null || $amount_paisa <= 0 || empty($allocations)) {
+        if ($amount_paisa === null || $amount_paisa <= 0 || $allocations === null) {
             return $this->errorPage('Bkash.error.invalid_amount');
         }
 
-        // Verify that the sum of individual invoice allocations matches the total charged amount exactly.
+        // Invoice allocations may not exceed the amount charged; any remainder is added to the client's credit.
         $allocation_total = 0;
         foreach ($allocations as $allocation) {
-            $paisa = $this->toPaisa($allocation['amount']);
-            if ($paisa === null || $paisa <= 0) {
-                return $this->errorPage('Bkash.error.invalid_amount');
-            }
-            $allocation_total += $paisa;
+            $allocation_total += $this->toPaisa($allocation['amount']);
         }
-        if ($allocation_total !== $amount_paisa) {
+        if ($allocation_total > $amount_paisa) {
             return $this->errorPage('Bkash.error.invalid_amount');
         }
 
         // ── Step 3: Create Local Payment Attempt Audit Record ──────────────────
         // Store an audit row in `bkash_payment_attempts` with a unique 30-minute TTL.
         // Generates a cryptographically random attempt_key and unique merchant invoice number.
+        $this->deleteExpiredAttempts();
         try {
             $attempt = $this->createPaymentAttempt([
                 'company_id' => (int) Configure::get('Blesta.company_id'),
@@ -610,8 +611,8 @@ class Bkash extends NonmerchantGateway
         }
 
         // If the customer cancelled on bKash portal, show user-friendly cancellation notice on the invoice page.
+        // validate() already recorded the failure; the status isn't signed, so it must not change the attempt here.
         if (strtolower((string) ($get['status'] ?? '')) !== 'success') {
-            $this->markAttemptFailed($attempt->id, 'customer_cancelled_or_failed');
             $this->Input->setErrors([
                 'general' => [
                     'invalid' => Language::_('Bkash.error.cancelled', true)
@@ -736,6 +737,26 @@ class Bkash extends NonmerchantGateway
             'amount' => $data['amount'],
             'merchant_invoice_number' => $data['merchant_invoice_number']
         ];
+    }
+
+    /**
+     * Deletes attempts that expired without being paid, e.g. a payment page that was viewed but never paid.
+     *
+     * Attempts with a bKash trxID, paid attempts ('verified'/'completed') and stuck 'executing' attempts are kept.
+     * A failed clean-up never blocks the payment being started.
+     */
+    private function deleteExpiredAttempts()
+    {
+        try {
+            $record = new Record();
+            $record->from(self::ATTEMPT_TABLE)
+                ->where('state', 'in', ['created', 'redirected', 'failed'])
+                ->where('expires_at', '<', gmdate('Y-m-d H:i:s'))
+                ->where('bkash_trx_id', '=', null)
+                ->delete();
+        } catch (Throwable $e) {
+            $this->log('payment-attempt', 'Could not delete expired payment attempts.', 'output', false);
+        }
     }
 
     /**
@@ -930,7 +951,7 @@ class Bkash extends NonmerchantGateway
     /**
      * Marks an attempt as failed with a diagnostic reason code.
      *
-     * Will NOT overwrite an attempt that has already reached the 'completed' state.
+     * Will NOT overwrite a paid attempt ('verified' or 'completed'), e.g. from a callback with an edited status.
      *
      * @param int $attempt_id Database row ID of the attempt
      * @param string $reason Diagnostic reason code (e.g. 'customer_cancelled_or_failed', 'verification_failed')
@@ -939,7 +960,7 @@ class Bkash extends NonmerchantGateway
     {
         $record = new Record();
         $record->where('id', '=', $attempt_id)
-            ->where('state', '!=', 'completed')
+            ->where('state', 'notin', ['verified', 'completed'])
             ->update(self::ATTEMPT_TABLE, [
                 'state' => 'failed',
                 'failure_reason' => substr($reason, 0, 100),
@@ -1356,10 +1377,10 @@ class Bkash extends NonmerchantGateway
      *
      * Converts mixed inputs (e.g. ['invoice_id' => 1, 'amount' => 50] or [1 => 50])
      * into a standard array of ['id' => <int>, 'amount' => '<decimal_string>'].
-     * Returns empty array if any item is non-numeric or invalid.
+     * Skips invoices with nothing to pay, e.g. already covered by the client's existing credit.
      *
      * @param array $invoice_amounts List of invoice allocations
-     * @return array Standardized array of invoice allocations, or empty array on error
+     * @return array|null Standardized array of invoice allocations, or null if any item is invalid
      */
     private function normalizeInvoiceAmounts(array $invoice_amounts)
     {
@@ -1373,7 +1394,10 @@ class Bkash extends NonmerchantGateway
                 $amount = $allocation;
             }
             if (!is_numeric($id) || (int) $id <= 0 || $this->toPaisa($amount) === null) {
-                return [];
+                return null;
+            }
+            if ($this->toPaisa($amount) === 0) {
+                continue;
             }
             $normalized[] = [
                 'id' => (int) $id,

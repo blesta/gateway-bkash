@@ -37,7 +37,7 @@ $lang['Bkash.!error.app_key.empty'] = 'Enter the bKash App Key.';
 $lang['Bkash.!error.app_secret.empty'] = 'Enter the bKash App Secret.';
 $lang['Bkash.!error.username.empty'] = 'Enter the bKash API username.';
 $lang['Bkash.!error.password.empty'] = 'Enter the bKash API password.';
-$lang['Bkash.!error.sandbox.valid'] = 'Enable exactly one gateway mode: Sandbox or Live.';
+$lang['Bkash.!error.sandbox.valid'] = 'Sandbox mode must be either enabled or disabled.';
 
 // ── Admin Settings Form Field Labels ─────────────────────────────────────────
 $lang['Bkash.app_key'] = 'App Key';
@@ -45,15 +45,9 @@ $lang['Bkash.app_secret'] = 'App Secret';
 $lang['Bkash.username'] = 'API Username';
 $lang['Bkash.password'] = 'API Password';
 $lang['Bkash.sandbox'] = 'Enable Sandbox (Test Mode)';
-$lang['Bkash.live'] = 'Enable Live Payments';
 
 // ── Admin Settings Form Helper & Warning Notes ───────────────────────────────
-$lang['Bkash.settings.mode_note'] = 'Only one mode can be enabled at a time. Live payments require Live API credentials and a public HTTPS callback URL.';
-$lang['Bkash.settings.credentials_note'] = 'App Secret and Password are encrypted in storage. Password fields are blank; enter all credentials again when saving.';
-
-// ── Admin Settings Card Section Headers ──────────────────────────────────────
-$lang['Bkash.section.api_credentials'] = 'API Credentials';
-$lang['Bkash.section.mode'] = 'Gateway Mode';
+$lang['Bkash.settings.mode_note'] = 'Uncheck to accept live payments, which require Live API credentials and a public HTTPS callback URL.';
 
 // ── Client-Facing Checkout Button ────────────────────────────────────────────
 $lang['Bkash.buildprocess.submit'] = 'Continue to bKash';

@@ -37,10 +37,13 @@ for BDT, the only currency bKash supports.
 - Live payments need Live credentials, and Blesta must be reachable at a public HTTPS address, because bKash returns
   clients to Blesta's gateway callback URL.
 
-If a payment can't be started or confirmed, the bKash API responses are under Tools > Logs > Gateway.
+To refund a payment, edit the transaction in Blesta, set its status to "Refunded" and check "Process this status
+change with the payment gateway". bKash refunds payments up to 60 days old.
+
+If a payment can't be started, confirmed or refunded, the bKash API responses are under Tools > Logs > Gateway.
 
 ### Blesta Compatibility
 
 |Blesta Version|Gateway Version|
 |--------------|--------------|
-|>= v6.0.0|v1.2.0|
+|>= v6.0.0|v1.2.0+|

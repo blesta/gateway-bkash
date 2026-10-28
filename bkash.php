@@ -67,13 +67,21 @@ class Bkash extends NonmerchantGateway
     }
 
     /**
-     * Creates the payment attempts table if it doesn't exist yet.
+     * Creates the payment attempts table if it doesn't exist yet, and adds the return URL to older tables.
      *
      * @param string $current_version The version currently installed
      */
     public function upgrade($current_version)
     {
         $this->createAttemptTable();
+
+        // Tables created before 1.3.0 have no return URL
+        $record = new Record();
+        if (!$record->query('SHOW COLUMNS FROM `' . self::ATTEMPT_TABLE . '` LIKE \'return_url\'')->fetch()) {
+            $record->query(
+                'ALTER TABLE `' . self::ATTEMPT_TABLE . '` ADD `return_url` TEXT NULL AFTER `invoice_amounts`'
+            );
+        }
     }
 
     /**
@@ -226,6 +234,7 @@ class Bkash extends NonmerchantGateway
                 'client_id' => (int) ($contact_info['client_id'] ?? 0),
                 'amount' => $this->formatPaisa($amount_paisa),
                 'invoice_amounts' => $allocations,
+                'return_url' => $options['return_url'] ?? null,
                 'merchant_invoice_number' => 'BL-' . bin2hex(random_bytes(12))
             ]);
         } catch (Throwable $e) {
@@ -454,6 +463,13 @@ class Bkash extends NonmerchantGateway
             return [];
         }
 
+        // Send the client back to where the payment started, e.g. the order form, unless that is this page
+        $return_path = rtrim((string) parse_url((string) $attempt->return_url, PHP_URL_PATH), '/');
+        $current_path = rtrim((string) parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH), '/');
+        if ($return_path !== '' && $return_path !== $current_path) {
+            header('Location: ' . $attempt->return_url);
+        }
+
         // Only show the cancel notice: validate() recorded the failure, and the status isn't signed
         if (strtolower((string) ($get['status'] ?? '')) !== 'success') {
             $this->Input->setErrors([
@@ -486,6 +502,48 @@ class Bkash extends NonmerchantGateway
     }
 
     /**
+     * Refunds a payment at bKash.
+     *
+     * @param string $reference_id The bKash trxID
+     * @param string $transaction_id The bKash paymentID
+     * @param float $amount The amount to refund
+     * @param string $notes The reason for the refund, sent to bKash
+     * @return array|null The transaction data, or null on failure
+     */
+    public function refund($reference_id, $transaction_id, $amount, $notes = null)
+    {
+        $amount_paisa = $this->toPaisa($amount);
+        $token = $amount_paisa > 0 ? $this->getAccessToken() : null;
+        if (!$token) {
+            $this->Input->setErrors($this->getCommonError('general'));
+            return null;
+        }
+
+        // bKash requires an SKU, but Blesta refunds payments rather than products
+        $response = $this->request('/payment/refund', [
+            'paymentID' => (string) $transaction_id,
+            'trxID' => (string) $reference_id,
+            'amount' => $this->formatPaisa($amount_paisa),
+            'sku' => 'NA',
+            'reason' => mb_substr($notes ?: Language::_('Bkash.refund.reason', true), 0, 255)
+        ], $token);
+
+        if ((string) ($response->transactionStatus ?? '') !== 'Completed' || empty($response->refundTrxID)) {
+            $this->Input->setErrors(
+                empty($response->statusMessage)
+                    ? $this->getCommonError('general')
+                    : ['refund' => ['failed' => Language::_('Bkash.!error.refund', true, $response->statusMessage)]]
+            );
+            return null;
+        }
+
+        return [
+            'status' => 'refunded',
+            'transaction_id' => $transaction_id
+        ];
+    }
+
+    /**
      * Creates the payment attempts table if it doesn't exist.
      * Attempt states: created -> redirected -> executing -> verified -> completed, or failed.
      */
@@ -505,6 +563,7 @@ class Bkash extends NonmerchantGateway
                 `amount` DECIMAL(14,2) NOT NULL,
                 `currency` CHAR(3) NOT NULL,
                 `invoice_amounts` TEXT NOT NULL,
+                `return_url` TEXT NULL,
                 `state` VARCHAR(16) NOT NULL DEFAULT \'created\',
                 `failure_reason` VARCHAR(100) NULL,
                 `verified_at` DATETIME NULL,
@@ -524,7 +583,8 @@ class Bkash extends NonmerchantGateway
     /**
      * Records a new payment attempt in the 'created' state.
      *
-     * @param array $data The company_id, gateway_id, client_id, amount, invoice_amounts and merchant_invoice_number
+     * @param array $data The company_id, gateway_id, client_id, amount, invoice_amounts, return_url and
+     *  merchant_invoice_number
      * @return array The attempt's id, attempt_key, client_id, amount and merchant_invoice_number
      * @throws RuntimeException If the company, gateway or client is missing
      */
@@ -546,6 +606,7 @@ class Bkash extends NonmerchantGateway
             'amount' => $data['amount'],
             'currency' => 'BDT',
             'invoice_amounts' => json_encode($data['invoice_amounts'], JSON_THROW_ON_ERROR),
+            'return_url' => $data['return_url'],
             'state' => 'created',
             'expires_at' => gmdate('Y-m-d H:i:s', time() + self::ATTEMPT_TTL_SECONDS),
             'created_at' => $now,
@@ -899,7 +960,9 @@ class Bkash extends NonmerchantGateway
             'payment_id' => ($response->paymentID ?? null),
             'transaction_id' => ($response->trxID ?? null),
             'currency' => ($response->currency ?? null),
-            'amount' => ($response->amount ?? null)
+            'amount' => ($response->amount ?? null),
+            'refund_transaction_id' => ($response->refundTrxID ?? null),
+            'status_message' => ($response->statusMessage ?? null)
         ];
         $this->log(
             $url,
